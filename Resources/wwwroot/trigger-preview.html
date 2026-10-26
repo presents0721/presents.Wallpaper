@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8" />
+  <title>壁纸挂件（Q 版形象）· 形态验证</title>
+  <style>
+    html,
+    body {
+      margin: 0;
+      height: 100%;
+      background: radial-gradient(1200px 800px at 60% 10%, #2b3550, #16181f 60%, #0b0c11);
+      color: #d8dee9;
+      font: 13px/1.6 system-ui, "Microsoft YaHei", sans-serif;
+      overflow: hidden;
+    }
+
+    .note {
+      position: absolute;
+      left: 26px;
+      top: 22px;
+      max-width: 460px;
+      color: #9aa4bb;
+      line-height: 1.8;
+    }
+
+    .note b {
+      color: #cfe6ff;
+    }
+
+    .note code {
+      color: #7cc4ff;
+      font-size: 12px;
+    }
+
+    /* ===== 以下与 AlifeBackground.cs 里注入的挂件样式一致 ===== */
+    #alife-wp-widget {
+      position: fixed;
+      right: 18px;
+      bottom: 112px;
+      z-index: 2147483645;
+      font: 13px/1.45 system-ui, "Microsoft YaHei", sans-serif;
+    }
+
+    #alife-wp-widget * {
+      box-sizing: border-box;
+    }
+
+    #alife-wp-widget .wp-trigger {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      height: 38px;
+      padding: 0 14px 0 11px;
+      margin-left: auto;
+      border-radius: 19px;
+      border: 1px solid rgba(255, 255, 255, .28);
+      background: rgba(22, 22, 28, .86);
+      color: #eaeaef;
+      font-size: 12px;
+      cursor: pointer;
+      box-shadow: 0 8px 22px rgba(0, 0, 0, .45);
+      backdrop-filter: blur(10px);
+      transition: background .15s;
+    }
+
+    #alife-wp-widget .wp-trigger:hover {
+      background: rgba(44, 44, 56, .92);
+    }
+
+    #alife-wp-widget .wp-pet-img {
+      display: none;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      pointer-events: none;
+      user-select: none;
+      -webkit-user-drag: none;
+      filter: drop-shadow(0 7px 16px rgba(0, 0, 0, .5));
+    }
+
+    #alife-wp-widget .wp-trigger.pet {
+      background: transparent;
+      border: 0;
+      box-shadow: none;
+      padding: 0;
+      height: auto;
+      border-radius: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: transform .16s ease;
+    }
+
+    #alife-wp-widget .wp-trigger.pet:hover {
+      background: transparent;
+      transform: scale(1.06);
+    }
+
+    #alife-wp-widget .wp-trigger.pet .wp-pet-img {
+      display: block;
+    }
+
+    #alife-wp-widget .wp-trigger.pet .wp-pet-fallback {
+      display: none;
+    }
+
+    #alife-wp-widget .wp-panel {
+      position: absolute;
+      right: 0;
+      bottom: 54px;
+      width: 326px;
+      max-width: calc(100vw - 24px);
+      max-height: min(78vh, 660px);
+      display: none;
+      flex-direction: column;
+      border-radius: 16px;
+      background: rgba(18, 18, 23, .93);
+      border: 1px solid rgba(255, 255, 255, .12);
+      box-shadow: 0 18px 44px rgba(0, 0, 0, .52);
+      backdrop-filter: blur(16px);
+      color: #e9e9ef;
+      overflow: hidden;
+    }
+
+    #alife-wp-widget.open .wp-panel {
+      display: flex;
+    }
+
+    #alife-wp-widget .wp-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(255, 255, 255, .08);
+    }
+
+    #alife-wp-widget .wp-head b {
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    #alife-wp-widget .wp-head span {
+      flex: 1;
+      color: #8b8b99;
+      font-size: 11px;
+    }
+
+    #alife-wp-widget .wp-sliders {
+      padding: 8px 12px;
+      display: grid;
+      gap: 7px;
+      border-bottom: 1px solid rgba(255, 255, 255, .08);
+    }
+
+    #alife-wp-widget .wp-sliders label {
+      display: grid;
+      grid-template-columns: 38px 1fr 30px;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: #a8a8b6;
+    }
+
+    #alife-wp-widget .wp-sliders i {
+      font-style: normal;
+      text-align: right;
+      color: #d6d6e0;
+    }
+
+    #alife-wp-widget .wp-list {
+      flex: 1;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 6px;
+      display: grid;
+      gap: 4px;
+    }
+
+    #alife-wp-widget .wp-item {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      padding: 6px;
+      border: 0;
+      border-radius: 9px;
+      background: transparent;
+      color: #e9e9ef;
+      cursor: pointer;
+      text-align: left;
+      width: 100%;
+      font-size: 12px;
+    }
+
+    #alife-wp-widget .wp-item:hover {
+      background: rgba(255, 255, 255, .07);
+    }
+
+    #alife-wp-widget .wp-item.current {
+      background: rgba(124, 196, 255, .18);
+      outline: 1px solid rgba(124, 196, 255, .5);
+    }
+  </style>
+</head>
+
+<body>
+  <div class="note">
+    <b>壁纸挂件 = Q 版大肥鱼</b><br />
+    这就是壁纸面板原有的胶囊位（<code>right:18px; bottom:112px</code>），只把按钮换成了透明 Q 版贴图。<br />
+    点一下它 → 上方的<b>壁纸面板</b>照旧展开（遮罩 / 白度 / 模糊 … + 壁纸列表）。<br />
+    <span style="color:#6f7788">面板底边会跟着形象高度自动上移（<code>bottom = 形象高度 + 12</code>），不会被头像压住。</span>
+  </div>
+
+  <div id="alife-wp-widget">
+    <div class="wp-panel">
+      <div class="wp-head"><b>壁纸</b><span>27 张</span></div>
+      <div class="wp-sliders">
+        <label>遮罩<input type="range" min="0" max="80" value="35"><i>35</i></label>
+        <label>白度<input type="range" min="0" max="100" value="0"><i>0</i></label>
+        <label>模糊<input type="range" min="0" max="30" value="0"><i>0</i></label>
+      </div>
+      <div class="wp-list">
+        <button class="wp-item current">初音未来 胧月——夜莺Night</button>
+        <button class="wp-item">Windows Chan [by tm0ji]</button>
+        <button class="wp-item">Shimmering Particles</button>
+        <button class="wp-item">Neon Sunset</button>
+      </div>
+    </div>
+
+    <button class="wp-trigger pet" id="trig" style="width:76px;height:76px;padding:0;border:0;background:transparent;box-shadow:none;cursor:pointer;">
+      <img class="wp-pet-img" src="/whale/pet-face.png" alt="" draggable="false">
+      <svg class="wp-pet-fallback" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+        stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="4" width="18" height="16" rx="2.5" />
+        <circle cx="8.5" cy="9.5" r="1.6" />
+        <path d="M21 16.2 15.6 10.8 7 20" />
+      </svg><span class="wp-pet-fallback">壁纸</span>
+    </button>
+  </div>
+
+  <script>
+    (function () {
+      var box = document.getElementById('alife-wp-widget');
+      var panel = box.querySelector('.wp-panel');
+      panel.style.bottom = (76 + 12) + 'px';   // = 形象高度 + 12
+
+      document.getElementById('trig').addEventListener('click', function () {
+        box.classList.toggle('open');
+      });
+
+      // 便于肉眼对比气泡版：按住 Shift 点一下切换
+      document.getElementById('trig').addEventListener('click', function (e) {
+        if (!e.shiftKey) return;
+        var img = box.querySelector('.wp-pet-img');
+        var face = img.getAttribute('src') === '/whale/pet-face.png';
+        img.setAttribute('src', face ? '/whale/pet-bubble.png' : '/whale/pet-face.png');
+      });
+    })();
+  </script>
+</body>
+
+</html>
