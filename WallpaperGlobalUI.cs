@@ -14,7 +14,7 @@ namespace presents.Wallpaper;
 /// 挂载时把 JS 执行器交给 <see cref="AlifeBackground"/>，并重放一次注入脚本。
 /// 组件本身不渲染任何内容，只当生命周期与脚本执行入口。
 /// </summary>
-public sealed class WallpaperGlobalUI : ComponentBase
+public sealed class WallpaperGlobalUI : ComponentBase, IDisposable
 {
     [Inject] IJSRuntime JS { get; set; } = null!;
 
@@ -38,4 +38,12 @@ public sealed class WallpaperGlobalUI : ComponentBase
     }
 
     Task<string> RunJsAsync(string script) => JS.InvokeAsync<string>("eval", script).AsTask();
+
+    public void Dispose()
+    {
+        // 组件卸载后旧的 IJSRuntime 已失效；留着静态委托会把页面脚本执行器
+        // 钉在一个已经不存在的组件上（热重载时尤其容易留尾巴）。
+        if (AlifeBackground.JsRunner is { } runner && ReferenceEquals(runner.Target, this))
+            AlifeBackground.JsRunner = null;
+    }
 }
