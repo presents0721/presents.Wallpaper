@@ -136,4 +136,32 @@ public sealed class WallpaperConfig
     [DisplayName("挂件位置 Y")]
     [Description("同上，-1 = 默认右下角。")]
     public int WidgetY { get; set; } = -1;
+
+    [DisplayName("窗口进入后台时暂停渲染")]
+    [Description("Alife 最小化 / 失焦 / 页面隐藏时暂停壁纸：停掉视频解码、卸载网页壁纸的独立渲染进程。切回前台自动恢复。")]
+    public bool PauseWhenHidden { get; set; } = true;
+
+    [DisplayName("后台立即释放显存")]
+    [Description("开启（默认）：后台立刻销毁 WebGL 场景，释放贴图 / 帧缓冲 / 场景包，实测可释放 1GB 以上显存；切回前台自动重挂（大场景需十几秒，期间显示预览图）。关闭：只暂停不释放，切回瞬间恢复，但 1GB 显存会一直占着。")]
+    public bool ReleaseGpuWhenHidden { get; set; } = true;
+
+    [DisplayName("画质档位（由你选，默认不降画质）")]
+    [Description("0 = 原样（默认，完全不干预：像素比跟随系统缩放、60 帧）；1 = 均衡（1.0 倍像素比 / 60 帧）；2 = 省显存（0.75 倍 / 30 帧）；3 = 自定义（用下面两项）。插件不擅自改画质。")]
+    public int QualityPreset { get; set; } = 0;
+
+    [DisplayName("自定义渲染像素比（%）")]
+    [Description("仅「画质档位 = 自定义」时生效。0 = 跟随系统像素比；100 = 1.0 倍；75 = 0.75 倍；50 = 半分辨率。")]
+    public int RenderScale { get; set; } = 0;
+
+    [DisplayName("自定义帧率上限")]
+    [Description("仅「画质档位 = 自定义」时生效，10–60。")]
+    public int MaxFps { get; set; } = 60;
+
+    [DisplayName("画质即时生效（不重建场景）")]
+    [Description("开启（推荐）：拖动像素 / 切换画质档位时直接改运行中的渲染参数，画面立刻变化，不重新加载场景包。关闭或某些壁纸不兼容时，退回「重建场景」的旧方式（大场景要等十几秒）。")]
+    public bool LiveTuning { get; set; } = true;
+
+    [DisplayName("纯展示模式（只放壁纸，关掉交互）")]
+    [Description("开启后只保留动态壁纸画面：关闭鼠标视差、指针跟随、场景脚本与用户属性、网页壁纸属性桥、音量增益，以及整页面板磨砂/DOM 扫描。切壁纸、挂件和后台释放显存仍然可用。")]
+    public bool SimpleMode { get; set; } = false;
 }
