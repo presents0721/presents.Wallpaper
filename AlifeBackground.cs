@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 
@@ -17,27 +18,85 @@ namespace presents.Wallpaper;
 /// </summary>
 internal sealed class AlifeBackground
 {
-    const string InitScript = """
+    /// <summary>
+    /// 独立的页面卸载脚本：不依赖 InitScript 里的任何闭包函数（旧版本可能根本没定义），
+    /// 只按 DOM id / window 标记做兜底清理。每个插件实例首次接入页面、以及模块销毁时都会跑一次，
+    /// 用来根治热重载堆积的旧渲染进程与显存。
+    /// </summary>
+    const string TeardownScript = """
         (function () {
-          // 版本守卫：插件重载后页面里还挂着旧脚本，必须让新版覆盖它，
-          // 否则一直跑老逻辑（旧版没有挂件、也没有磨砂面板）。
-          var VER = '5.7.2';
-          if (window.__alifeWpVer === VER && window.__alifeWallpaperShow) return 'ready';
+          try { if (window.__alifeWallpaperTeardown) window.__alifeWallpaperTeardown(); } catch (e) { }
+          try { if (window.__alifeWallpaperClear) window.__alifeWallpaperClear(false); } catch (e) { }
+          try { if (window.__alifeWallpaperRestore) window.__alifeWallpaperRestore(); } catch (e) { }
+          try { if (window.__alifeWpAbort) window.__alifeWpAbort.abort(); } catch (e) { }
 
-          // 换版本时旧挂件的 DOM 和事件还挂在页面上（__alifeWallpaperWidget 见到就早退），
-          // 不拆掉的话重载插件后调的永远是上一版的按钮
-          var stale = !!window.__alifeWpVer && window.__alifeWpVer !== VER;
-          window.__alifeWpVer = VER;
+          // 跨源 iframe 会占一个独立的 WebView2 渲染进程：只 removeChild 不一定马上退，
+          // 必须先把 src 卸成 about:blank。
+          var frames = document.querySelectorAll('#alife-wallpaper iframe');
+          for (var i = 0; i < frames.length; i++) { try { frames[i].src = 'about:blank'; } catch (e) { } }
 
-          if (stale) {
-            var oldBox = document.getElementById('alife-wp-widget');
-            if (oldBox && oldBox.parentNode) oldBox.parentNode.removeChild(oldBox);
-            var oldCss = document.getElementById('alife-wp-widget-style');
-            if (oldCss && oldCss.parentNode) oldCss.parentNode.removeChild(oldCss);
+          var vids = document.querySelectorAll('#alife-wallpaper video');
+          for (var j = 0; j < vids.length; j++) {
+            try { vids[j].pause(); vids[j].removeAttribute('src'); vids[j].load(); } catch (e) { }
           }
 
-          // 覆盖前先还原旧版留下的透明化，否则 __alifeWpBg 标记会让新版跳过这些面板
+          var ids = ['alife-wallpaper', 'alife-wp-scene', 'alife-wp-widget', 'alife-wp-widget-style', 'alife-wallpaper-style'];
+          for (var k = 0; k < ids.length; k++) {
+            var el = document.getElementById(ids[k]);
+            if (el && el.parentNode) el.parentNode.removeChild(el);
+          }
+
+          try { if (window.__alifeWpObs) window.__alifeWpObs.disconnect(); } catch (e) { }
+          try { if (window.__alifeWpAudioCtx) window.__alifeWpAudioCtx.close(); } catch (e) { }
+
+          window.__alifeWpObs = null;
+          window.__alifeWpAudioCtx = null;
+          window.__alifeWpScene = null;
+          window.__alifeWpLib = null;
+          window.__alifeWpLibPromise = null;
+          window.__alifeWpCfg = null;
+          window.__alifeWpVer = null;
+          window.__alifeWpMountRetry = false;
+          window.__alifeWpVisHooked = false;
+          window.__alifeWpReleased = false;
+          window.__alifeWpSetActive = null;
+          window.__alifeWallpaperShow = null;
+          window.__alifeWallpaperClear = null;
+          window.__alifeWallpaperWidget = null;
+          window.__alifeWallpaperTransparent = null;
+          window.__alifeWallpaperRestyle = null;
+          window.__alifeWallpaperMedia = null;
+          window.__alifeWallpaperSetProps = null;
+          window.__alifeWallpaperTeardown = null;
+          return 'ok';
+        })()
+        """;
+
+    const string InitScript = """
+        (function () {
+          var VER = '5.9.16';
+          if (window.__alifeWpVer === VER && window.__alifeWallpaperShow) return 'ready';
+
+          // 换版本 = 上一代脚本还挂在页面上。先把它的 document 事件、WebGL 场景、
+          // 跨源 iframe、挂件 DOM 全部解引用，否则每重载一次就多留一份渲染进程 / 显存。
+          try { if (window.__alifeWpAbort) window.__alifeWpAbort.abort(); } catch (e) { }
+          try { if (window.__alifeWallpaperTeardown) window.__alifeWallpaperTeardown(); } catch (e) { }
+          try { if (window.__alifeWallpaperClear) window.__alifeWallpaperClear(false); } catch (e) { }
           try { if (window.__alifeWallpaperRestore) window.__alifeWallpaperRestore(); } catch (e) { }
+
+          var staleIds = ['alife-wallpaper', 'alife-wp-widget', 'alife-wp-widget-style', 'alife-wallpaper-style', 'alife-wp-scene'];
+          for (var si = 0; si < staleIds.length; si++) {
+            var staleEl = document.getElementById(staleIds[si]);
+            if (staleEl && staleEl.parentNode) staleEl.parentNode.removeChild(staleEl);
+          }
+
+          // 这一代的所有 document / window 事件都挂到同一个 AbortController 上，
+          // 卸载时一次 abort 就能把旧闭包全部解引用（旧闭包持有 GL 上下文与 iframe）。
+          var wpAbort = new AbortController();
+          window.__alifeWpAbort = wpAbort;
+          var SIG = { signal: wpAbort.signal };
+          function wps(o) { (o || (o = {})).signal = wpAbort.signal; return o; }
+          window.__alifeWpVer = VER;
 
           // 根据配置刷新样式表（遮罩 / 模糊都走这里，调参不用重建 <video>）
           function wpApplyStyle(cfg) {
@@ -61,15 +120,27 @@ internal sealed class AlifeBackground
               ? 'rgba(255,255,255,' + o + ')'
               : 'rgba(0,0,0,' + o + ')';
 
+            // blur(0px) / 全 100% 的 filter 一样会逼 Chromium 给整屏分配离屏纹理，
+            // 默认值时干脆不写这两条 CSS，省下一整张屏幕大小的显存。
+            var blurRule = b > 0 ? 'backdrop-filter:blur(' + b + 'px)!important;' : '';
+            var filterRule = (br === 1 && ct === 1 && sa === 1)
+              ? '' : 'filter:brightness(' + br + ') contrast(' + ct + ') saturate(' + sa + ');';
+
+            // 遮罩 / 模糊挂在壁纸层自己的伪元素上，不依赖主界面的类名。
+            // Alife 5.x 的界面已经变成 #app > .app-shell > section.app-main，
+            // 旧规则里的 .app-container / .main-content 根本不存在，写了等于没写。
+            var scrimRule =
+              '#alife-wallpaper::after{content:"";position:absolute;inset:0;pointer-events:none;' +
+              'background:' + scrim + ';' + blurRule + '}';
+
             style.textContent =
               'html,body{background:transparent!important;}' +
               '#alife-wallpaper{position:fixed;inset:0;z-index:0;overflow:hidden;pointer-events:none;background:#000;' +
-                'filter:brightness(' + br + ') contrast(' + ct + ') saturate(' + sa + ');' +
+                filterRule +
                 'opacity:1;transition:opacity .35s ease;}' +
               '#alife-wallpaper>video,#alife-wallpaper>img,#alife-wallpaper>iframe{width:100%;height:100%;object-fit:cover;border:0;display:block;}' +
               '#alife-wallpaper>iframe{pointer-events:none;}' +
-              '.app-container{position:relative;z-index:1;background:' + scrim + '!important;backdrop-filter:blur(' + b + 'px)!important;transition:background-color .18s ease!important;}' +
-              '.main-content{background:transparent!important;}';
+              scrimRule;
           }
 
           // ---------------- Scene 实时渲染（WebWallGL） ----------------
@@ -113,51 +184,162 @@ internal sealed class AlifeBackground
             if (host && host.parentNode) host.parentNode.removeChild(host);
           }
 
-          // 窗口隐藏时 rAF 完全不跑：此时挂载永远等不到首帧，15s 看门狗一超时就退回静态
-          // 预览图，之后点什么都没反应。所以隐藏期间不挂，等回到前台再挂。
-          function wpArmMountRetry() {
-            if (window.__alifeWpMountRetry) return;
-            window.__alifeWpMountRetry = true;
+          // ---------------- 后台不渲染 / 立即释放显存 ----------------
+          // 实测：pause() + display:none 时 GPU 专用显存 1416MB 一字节不掉 ——
+          // GL 纹理、离屏 FBO、贴图集和场景包 ArrayBuffer 全都还驻留着。
+          // 只有 destroy()（库内部 WEBGL_lose_context）能真正释放，掉到 284MB。
+          // Chromium 会节流 / 冻结隐藏页面的 setTimeout，「等 N 分钟再深睡」不可靠，
+          // 所以在收到 blur / visibilitychange 的当下就释放。
+          var wpActive = true;
+          var wpBlurred = false;
+          var wpWatch = 0;
 
-            document.addEventListener('visibilitychange', function () {
-              if (document.hidden) return;
-
-              window.__alifeWpMountRetry = false;
-
-              var cfg = window.__alifeWpCfg || {};
-              var root = document.getElementById('alife-wallpaper');
-
-              if (!root || !cfg.liveScene || !cfg.pkg || !cfg.lib) return;
-              if (document.getElementById('alife-wp-scene')) return;
-
-              wpMountLiveScene(root, cfg);
-            });
+          // 只认「页面隐藏」（最小化 / 切到后台），不再看 blur / hasFocus：
+          // WebView2 的 blur / focus 配对不可靠 —— 经常只发 blur 不发 focus，
+          // 一旦用它当判据，壁纸会永远停在“后台”，切面板后新 DOM 也不再补涂（整片白）。
+          // 窗口还看得见就应该继续渲染；真最小化时 document.hidden 一定会变 true。
+          function wpIsBackground() {
+            return !!document.hidden;
           }
 
-          function wpMountLiveScene(root, cfg) {
-            if (!window.__alifeWpVisHooked) {
-              window.__alifeWpVisHooked = true;
+          function wpPauseMedia(root) {
+            if (!root) return;
 
-              document.addEventListener('visibilitychange', function () {
-                var inst = window.__alifeWpScene;
+            var vids = root.querySelectorAll('video');
+            for (var i = 0; i < vids.length; i++) { try { vids[i].pause(); } catch (e) { } }
 
-                if (document.hidden) {
-                  if (inst) { try { inst.pause(); } catch (e) { } }
-                  return;
-                }
-
-                if (inst) { try { inst.resume(); } catch (e) { } return; }
-
-                // 场景已经没了（挂载曾经超时），回到前台补挂一次
-                var cur = window.__alifeWpCfg || {};
-                var rt = document.getElementById('alife-wallpaper');
-
-                if (rt && cur.liveScene && cur.pkg && cur.lib && !document.getElementById('alife-wp-scene'))
-                  wpMountLiveScene(rt, cur);
-              });
+            var frames = root.querySelectorAll('iframe');
+            for (var j = 0; j < frames.length; j++) {
+              var f = frames[j];
+              try {
+                if (f.src && f.src !== 'about:blank') f.dataset.wpSrc = f.src;
+                f.src = 'about:blank';
+              } catch (e) { }
             }
 
-            if (document.hidden) { wpArmMountRetry(); return; }
+            var inst = window.__alifeWpScene;
+            if (inst && typeof inst.pause === 'function') { try { inst.pause(); } catch (e) { } }
+          }
+
+          function wpResumeMedia(root) {
+            if (!root) return;
+
+            var frames = root.querySelectorAll('iframe');
+            for (var j = 0; j < frames.length; j++) {
+              var f = frames[j];
+              if (f.dataset.wpSrc) { try { f.src = f.dataset.wpSrc; } catch (e) { } }
+            }
+
+            var vids = root.querySelectorAll('video');
+            for (var i = 0; i < vids.length; i++) {
+              try { var p = vids[i].play(); if (p && p.catch) p.catch(function () { }); } catch (e) { }
+            }
+
+            var inst = window.__alifeWpScene;
+            if (inst && typeof inst.resume === 'function') { try { inst.resume(); } catch (e) { } }
+          }
+
+          function wpArmMountRetry() { window.__alifeWpMountRetry = true; }
+
+          // 真正释放显存：删掉 GL 场景（库内部会 loseContext + 释放 pkg 缓存）、
+          // 卸掉跨源 iframe、解引用库对象（它还挂着贴图与 235MB 的包）。
+          // 预览图 <img> 保留，界面不闪；回前台由 wpWake 重建整层。
+          function wpReleaseGpu() {
+            var root = document.getElementById('alife-wallpaper');
+            if (!root || !window.__alifeWpCfg) return;
+
+            wpDisposeScene();
+            var frames = root.querySelectorAll('iframe');
+            for (var i = 0; i < frames.length; i++) {
+              try { frames[i].src = 'about:blank'; } catch (e) { }
+            }
+
+            window.__alifeWpLib = null;
+            window.__alifeWpLibPromise = null;
+            window.__alifeWpLibVer = null;
+            window.__alifeWpReleased = true;
+            root.dataset.wpReleased = '1';
+          }
+
+          function wpWake() {
+            var cfg = window.__alifeWpCfg;
+            var root = document.getElementById('alife-wallpaper');
+            if (!root || !cfg) return;
+
+            // GPU 已释放 / 后台期间挂载超时：整层重建，避免半死不活的 GL 上下文
+            if (window.__alifeWpReleased || (window.__alifeWpMountRetry && cfg.liveScene && cfg.pkg)) {
+              window.__alifeWpReleased = false;
+              window.__alifeWpMountRetry = false;
+              root.dataset.wpReleased = '';
+              root.dataset.key = '';
+              try { window.__alifeWallpaperShow(cfg); return; } catch (e) { }
+            }
+
+            wpResumeMedia(root);
+            if (window.__alifeWallpaperTransparent) window.__alifeWallpaperTransparent();
+          }
+
+          function wpSetActive(active) {
+            var cfg = window.__alifeWpCfg || {};
+            if (cfg.pauseWhenHidden === false) active = true;
+            // 只在「页面真的还隐藏着」时才拒绝对恢复，避免被不可靠的焦点状态挡住。
+            else if (active && document.hidden) return;
+
+            if (active === wpActive) return;
+            wpActive = active;
+
+            var root = document.getElementById('alife-wallpaper');
+            clearInterval(wpWatch);
+
+            if (!active) {
+              if (root) wpPauseMedia(root);
+
+              // 默认立刻释放；只有用户明确关掉「后台立即释放显存」才退回
+              // 旧的「只暂停」行为（切回瞬间恢复，但显存一直占着）。
+              if (cfg.releaseGpuWhenHidden !== false) wpReleaseGpu();
+              else if (root) root.style.display = 'none';
+
+              // 观察器保持常驻：页面不变时它不会触发，几乎没有开销。
+              // 一旦在这里断开，后台切面板重建的 DOM 就没人补涂了（整片白），
+              // 而且回前台不一定有 focus 事件，靠它重建并不可靠。
+
+              // 低频自查只认「页面是否可见」，不再看焦点。
+              wpWatch = setInterval(function () {
+                if (!document.hidden) wpSetActive(true);
+              }, 1500);
+            } else {
+              if (root) root.style.display = '';
+              wpWake();
+
+              // 窗口在后台 / 被遮挡时 Chromium 会暂停合成，切回来常常要等下一次重绘
+              // 才看得到半透明面板（用户看到的就是“白板，晃一下/截图才透”）。
+              // 这里立刻补涂一次，再在下一帧补一次，把这个窗口压到最短。
+              if (window.__alifeWallpaperTransparent) window.__alifeWallpaperTransparent();
+              if (typeof requestAnimationFrame === 'function') {
+                requestAnimationFrame(function () {
+                  if (window.__alifeWallpaperTransparent) window.__alifeWallpaperTransparent();
+                });
+              }
+            }
+          }
+          window.__alifeWpSetActive = wpSetActive;
+
+          wpAbort.signal.addEventListener('abort', function () {
+            clearInterval(wpWatch);
+          }, { once: true });
+
+          document.addEventListener('visibilitychange', function () {
+            wpSetActive(!wpIsBackground());
+          }, SIG);
+          // 失焦但页面仍可见时不释放（内容还看得见，突然白掉更糟）。
+          // 真正的后台只由 visibilitychange 处理。
+          window.addEventListener('blur', function () { wpBlurred = true; }, SIG);
+          window.addEventListener('focus', function () { wpBlurred = false; wpSetActive(true); }, SIG);
+
+          function wpMountLiveScene(root, cfg) {
+            // 后台不挂场景：rAF 在隐藏时不跑，首帧看门狗会超时并把场景拆掉。
+            // 回到前台由 wpWake 统一补挂，不再各自注册 visibilitychange。
+            if (document.hidden || !wpActive) { wpArmMountRetry(); return; }
 
             var host = document.createElement('div');
             host.id = 'alife-wp-scene';
@@ -179,10 +361,10 @@ internal sealed class AlifeBackground
               }).then(function (buf) {
                 if (!alive()) return null;
 
-                return Promise.resolve(lib.mount(host, {
+                var mountOpts = {
                   source: lib.bytesSource(new Uint8Array(buf), null, cfg.key || cfg.pkg),
                   fit: cfg.fit === 'contain' ? 'contain' : 'cover',
-                  fps: 60,
+                  fps: Math.max(10, Math.min(60, +cfg.maxFps || 60)),
                   volume: 0,
                   scripts: cfg.scripts !== false,   // 关掉就没有属性通路：数值只会被暂存，永远不生效
                   // 只下发用户真的改过的值，其余留给场景自己的默认值
@@ -197,12 +379,32 @@ internal sealed class AlifeBackground
                     console.warn('[wallpaper] 场景渲染失败，保留预览图：' + ((err && err.message) || err));
                     wpDisposeScene();
                   }
-                }));
+                };
+
+                // 画质档位 0（原样）时 renderDpr 为 null：完全不传这个参数，
+                // 让库按 devicePixelRatio 自己决定，不擅自降画质。
+                if (cfg.renderDpr != null && +cfg.renderDpr > 0)
+                  mountOpts.renderDpr = Math.max(0.25, Math.min(2, +cfg.renderDpr));
+
+                return Promise.resolve(lib.mount(host, mountOpts));
               });
             }).then(function (inst) {
               if (!inst) return;
               if (!alive()) { try { inst.destroy({ releasePkgCache: true }); } catch (e) { } return; }
               window.__alifeWpScene = inst;
+
+              // 画质档位：粒子 / 后处理在场景起来之后用运行时接口应用，
+              // 像素比若被运行时改过（liveDpr）也在这里沿用，避免重建后回到默认。
+              try {
+                if ((cfg.particles || cfg.postProcessing) && typeof inst.setQuality === 'function') {
+                  var q0 = inst.getQuality ? inst.getQuality() : {};
+                  if (cfg.particles) q0.particles = cfg.particles;
+                  if (cfg.postProcessing) q0.postProcessing = cfg.postProcessing;
+                  inst.setQuality(q0);
+                }
+                if (cfg.liveDpr !== undefined && typeof inst.setRenderDpr === 'function')
+                  inst.setRenderDpr(cfg.liveDpr == null ? null : +cfg.liveDpr);
+              } catch (e) { }
 
               // 挂载那一刻场景对象还没建好，紧接着下发的属性会被直接丢掉，
               // 场景随后用自己的默认值渲染 —— 用户存下来的开关就全都"没效果"。
@@ -227,7 +429,7 @@ internal sealed class AlifeBackground
               wpDisposeScene();
 
               // 首帧超时 + 当时窗口不在前台：等切回来再挂，别就此停成一张静态图
-              if (msg.indexOf('首帧超时') >= 0) wpArmMountRetry();
+              if (msg.indexOf('首帧超时') >= 0 && (document.hidden || !wpActive)) wpArmMountRetry();
             });
           }
 
@@ -276,6 +478,12 @@ internal sealed class AlifeBackground
             };
 
             document.addEventListener('pointermove', function (e) {
+              // 用户回到窗口一定会动鼠标：这是最可靠的前台信号，
+              // 不依赖宿主会不会发 focus、也不依赖 hasFocus() 准不准。
+              if (!wpActive && !document.hidden) { wpBlurred = false; wpSetActive(true); }
+              // 纯展示：不做视差，也不把指针转发给场景引擎
+              if (window.__alifeWpSimple) return;
+
               var w = window.innerWidth || 1, h = window.innerHeight || 1;
 
               tx = (e.clientX / w) * 2 - 1;
@@ -287,12 +495,12 @@ internal sealed class AlifeBackground
               }
 
               kick();
-            }, { passive: true });
+            }, wps({ passive: true }));
 
             document.addEventListener('pointerleave', function () {
               tx = 0; ty = 0;
               kick();
-            }, { passive: true });
+            }, wps({ passive: true }));
           })();
 
           window.__alifeWallpaperShow = function (cfg) {
@@ -312,23 +520,41 @@ internal sealed class AlifeBackground
               document.head.appendChild(style);
             }
 
+            var wasSimple = !!window.__alifeWpSimple;
             window.__alifeWpCfg = cfg;
-            if (window.__alifeWpSetParallax) window.__alifeWpSetParallax(cfg.parallax);
+            window.__alifeWpSimple = !!cfg.simple;
+            // 从纯展示切回普通：把冻结的面板底色还原，让磨砂重新涂一遍
+            if (wasSimple && !window.__alifeWpSimple && window.__alifeWallpaperRestore)
+              window.__alifeWallpaperRestore();
+            if (window.__alifeWpSimple && window.__alifeWpObs) {
+              try { window.__alifeWpObs.disconnect(); } catch (e) { }
+              window.__alifeWpObs = null;
+            }
+            if (window.__alifeWpSetParallax) window.__alifeWpSetParallax(window.__alifeWpSimple ? 0 : cfg.parallax);
+
+            // 首次挂载就把磨砂 / 气泡的 alpha 写进 CSS 变量，后续调参只改变量
+            if (document.documentElement) {
+              if (cfg.panel != null) document.documentElement.style.setProperty('--alife-wp-frost-a', String(cfg.panel));
+              if (cfg.bubble != null) document.documentElement.style.setProperty('--alife-wp-bubble-a', String(cfg.bubble));
+            }
+
             wpApplyStyle(cfg);
 
             // 透明化和挂件必须在 key 早退之前做：壁纸没换时也要保证它们存在
             if (window.__alifeWallpaperTransparent) window.__alifeWallpaperTransparent();
             if (window.__alifeWallpaperWidget) window.__alifeWallpaperWidget(!!cfg.widget, cfg.api, cfg.petAvatar, cfg.petSize, cfg.widgetX, cfg.widgetY, cfg.wpanel);
 
-            // 刚重载 / 刚换页时 DOM 还在长，补几遍，别让人盯着白底等：
-            // 0ms 已经涂过，这里补 200 / 800 / 1800ms 三次（之后交给 MutationObserver）
-            var repaint = [200, 800, 1800];
-            for (var rp = 0; rp < repaint.length; rp++) {
-              (function (delay) {
-                setTimeout(function () {
-                  if (window.__alifeWallpaperTransparent) window.__alifeWallpaperTransparent();
-                }, delay);
-              })(repaint[rp]);
+            // 刚重载 / 刚换页时 DOM 还在长，补几遍（纯展示不改写主界面 DOM，跳过）
+            // 越靠前越密：Alife 的聊天区是先白底、再被路由填充，早涂一次就少一段白屏
+            if (!window.__alifeWpSimple) {
+              var repaint = [60, 180, 400, 900, 1800, 3200];
+              for (var rp = 0; rp < repaint.length; rp++) {
+                (function (delay) {
+                  setTimeout(function () {
+                    if (window.__alifeWallpaperTransparent) window.__alifeWallpaperTransparent();
+                  }, delay);
+                })(repaint[rp]);
+              }
             }
 
             if (root.dataset.key === cfg.key) return 'same';
@@ -336,6 +562,17 @@ internal sealed class AlifeBackground
 
             // 换壁纸：先把上一张场景的 GL 资源、pkg 缓存和画布一起清掉
             wpDisposeScene();
+
+            // 网页壁纸的跨源 iframe 会占一个独立渲染进程，换张时先卸 src，
+            // 否则旧页面的渲染循环 / WebGL 可能还在后台继续跑。
+            var oldFrames = root.querySelectorAll('iframe');
+            for (var fi = 0; fi < oldFrames.length; fi++) {
+              try { oldFrames[fi].src = 'about:blank'; } catch (e) { }
+            }
+            var oldVids = root.querySelectorAll('video');
+            for (var vi = 0; vi < oldVids.length; vi++) {
+              try { oldVids[vi].pause(); oldVids[vi].removeAttribute('src'); oldVids[vi].load(); } catch (e) { }
+            }
 
             while (root.firstChild) root.removeChild(root.firstChild);
 
@@ -400,12 +637,25 @@ internal sealed class AlifeBackground
               root.style.opacity = '1';
             }
 
+            // 插件在窗口已失焦 / 隐藏时启动的话没有任何事件可触发，
+            // 这里主动同步一次，保证第一帧就不渲染。
+            if (wpIsBackground()) wpSetActive(false);
+            else if (!wpActive) wpSetActive(true);
+
             return 'ok';
           };
 
           // 只调参数（遮罩 / 面板 / 模糊）时走这里，不重建媒体元素
           window.__alifeWallpaperRestyle = function (cfg) {
-            window.__alifeWpCfg = cfg;
+            // 这里只带样式字段，不能直接覆盖：pkg / url / liveScene / 后台参数还在旧 cfg 里，
+            // 覆盖掉之后「重新挂载」和「深睡唤醒」会拿不到 scene.pkg。
+            var prev = window.__alifeWpCfg || {};
+            // 只有「白度 / 气泡」是写在元素内联样式上的，改了才需要整页重涂。
+            // 遮罩 / 模糊 / 亮度 / 对比 / 饱和 / 视差只改一层 CSS，
+            // 不必每拖一格滑条就 Restore + Transparent 全页扫描一遍。
+            var needRepaint = (prev.panel !== cfg.panel) || (prev.bubble !== cfg.bubble);
+            for (var rk in cfg) if (Object.prototype.hasOwnProperty.call(cfg, rk)) prev[rk] = cfg[rk];
+            window.__alifeWpCfg = prev;
             if (window.__alifeWpSetParallax) window.__alifeWpSetParallax(cfg.parallax);
             wpApplyStyle(cfg);
             // 挂件形象跟着设置面板即时变（挂件还没建好时，由创建流程拿 cfg 兜底）
@@ -416,14 +666,22 @@ internal sealed class AlifeBackground
             if (window.__alifeWpPanelLook && cfg.wpanel !== undefined) {
               try { window.__alifeWpPanelLook(cfg.wpanel); } catch (e) { }
             }
-            if (window.__alifeWallpaperRestore) window.__alifeWallpaperRestore();
-            if (window.__alifeWallpaperTransparent) window.__alifeWallpaperTransparent();
+            if (needRepaint) {
+              // 只改两个 CSS 变量：所有已涂元素瞬间跟着变，
+              // 不再「先还原成不透明、再全页重涂」—— 那正是卡顿和闪烁的来源。
+              var rootEl = document.documentElement;
+              if (rootEl) {
+                if (cfg.panel != null) rootEl.style.setProperty('--alife-wp-frost-a', String(cfg.panel));
+                if (cfg.bubble != null) rootEl.style.setProperty('--alife-wp-bubble-a', String(cfg.bubble));
+              }
+            }
             return 'ok';
           };
 
           // 只改媒体参数（静音 / 音量 / 倍速），不影响壁纸层本身
           // 网页壁纸：把属性 postMessage 进 iframe（跨源，碰不到它的 document）
           function wpPostWebProps(props) {
+            if (window.__alifeWpSimple) return false;
             var frame = document.querySelector('#alife-wallpaper iframe');
             if (!frame || !frame.contentWindow) return false;
 
@@ -501,7 +759,7 @@ internal sealed class AlifeBackground
 
           // 音量 0-200：100 以上靠 WebAudio 增益推，元素本身固定 1.0
           function wpWireGain(v, pct) {
-            if (!v) return false;
+            if (!v || window.__alifeWpSimple) return false;
 
             if (!window.__alifeWpAudioCtx) {
               var Ctx = window.AudioContext || window.webkitAudioContext;
@@ -532,6 +790,7 @@ internal sealed class AlifeBackground
 
           // 浏览器策略下 AudioContext 要用户点一下才 running：点任意处就恢复并接上增益
           document.addEventListener('pointerdown', function () {
+            if (window.__alifeWpSimple) return;
             var ctx = window.__alifeWpAudioCtx;
             if (!ctx || ctx.state !== 'suspended') return;
             ctx.resume().then(function () {
@@ -539,7 +798,7 @@ internal sealed class AlifeBackground
               var cfg = window.__alifeWpCfg || {};
               if (v) wpWireGain(v, cfg.volume);
             }).catch(function () { });
-          }, { passive: true });
+          }, wps({ passive: true }));
 
           window.__alifeWallpaperMedia = function (cfg) {
             var root = document.getElementById('alife-wallpaper');
@@ -578,16 +837,48 @@ internal sealed class AlifeBackground
               try { window.__alifeWpObs.disconnect(); } catch (e) { }
               window.__alifeWpObs = null;
             }
+            clearInterval(wpWatch);
 
             // 用户主动“清除壁纸”时保留挂件，否则挂件没了就再也叫不回来
             if (!keepWidget && window.__alifeWallpaperWidget) window.__alifeWallpaperWidget(false);
             if (window.__alifeWallpaperRestore) window.__alifeWallpaperRestore();
 
             var root = document.getElementById('alife-wallpaper');
-            if (root && root.parentNode) root.parentNode.removeChild(root);
+            if (root) {
+              // 先卸 iframe 的 src：跨源 iframe 是独立的 WebView2 渲染进程，
+              // 直接 removeChild 只能解 DOM，进程不一定马上退。
+              var frames = root.querySelectorAll('iframe');
+              for (var ci = 0; ci < frames.length; ci++) {
+                try { frames[ci].src = 'about:blank'; } catch (e) { }
+              }
+              var vids = root.querySelectorAll('video');
+              for (var cv = 0; cv < vids.length; cv++) {
+                try { vids[cv].pause(); vids[cv].removeAttribute('src'); vids[cv].load(); } catch (e) { }
+              }
+              if (root.parentNode) root.parentNode.removeChild(root);
+            }
 
             var style = document.getElementById('alife-wallpaper-style');
             if (style && style.parentNode) style.parentNode.removeChild(style);
+
+            // 库对象里还压着场景包 / 贴图缓存，清掉引用让 GC 能收回上百 MB 工作集
+            window.__alifeWpScene = null;
+            window.__alifeWpLib = null;
+            window.__alifeWpLibPromise = null;
+            window.__alifeWpLibVer = null;
+            window.__alifeWpCfg = null;
+            window.__alifeWpReleased = false;
+            window.__alifeWpMountRetry = false;
+          };
+
+          // 彻底卸载：热重载 / 模块销毁走这里（TeardownScript 也会先调它）
+          window.__alifeWallpaperTeardown = function () {
+            try { window.__alifeWallpaperClear(false); } catch (e) { }
+            try { if (window.__alifeWpAbort) window.__alifeWpAbort.abort(); } catch (e) { }
+            try { if (window.__alifeWpAudioCtx) window.__alifeWpAudioCtx.close(); } catch (e) { }
+            window.__alifeWpAudioCtx = null;
+            window.__alifeWpVer = null;
+            return 'ok';
           };
 
           // 这些元素自身的底色要保留（输入框、按钮、图标…），不做透明化
@@ -630,6 +921,8 @@ internal sealed class AlifeBackground
           // 页面切来切去会重建 DOM，新节点上的磨砂就丢了；
           // 用 MutationObserver 盯着 body，有新增节点就自动补一次（不监听属性，避免自己改样式触发死循环）
           function wpObserve() {
+            // 纯展示模式也必须常驻：它只监听 childList，页面不变化就不会触发；
+            // 一旦跳过，切面板新建的 DOM 没人补涂 —— 整片白底。
             if (window.__alifeWpObs || !document.body || !window.MutationObserver) return;
 
             var timer = 0;
@@ -641,7 +934,7 @@ internal sealed class AlifeBackground
               clearTimeout(timer);
               timer = setTimeout(function () {
                 if (window.__alifeWallpaperTransparent) window.__alifeWallpaperTransparent();
-              }, 300);
+              }, 80);
             });
 
             window.__alifeWpObs.observe(document.body, { childList: true, subtree: true });
@@ -652,7 +945,9 @@ internal sealed class AlifeBackground
           function wpFrost(el, alpha) {
             if (el.__alifeWpBg !== undefined) return false;
 
-            var value = 'rgba(255,255,255,' + alpha + ')';
+            // alpha 走 CSS 变量：之后调「白度」只改变量，浏览器自己重绘，
+            // 不必先还原成不透明再全页重涂（那会造成“瞬间全白、很久才变”）。
+            var value = 'rgba(255,255,255,var(--alife-wp-frost-a,' + alpha + '))';
             for (var n = el.parentElement; n; n = n.parentElement) {
               if (n.__alifeWpBg !== undefined) { value = 'transparent'; break; }
             }
@@ -663,7 +958,10 @@ internal sealed class AlifeBackground
             // 加个过渡，避免切页时“啪”一下由白变磨砂
             if (!el.style.transition) el.style.setProperty('transition', 'background-color .16s ease');
 
-            el.style.setProperty('background', value, 'important');
+            // 只写 background-color，不用 background 简写：
+            // 简写会重置同元素已有的 background-image，而且一旦变量解析失败
+            // 整条声明会被丢弃，元素就退回不透明白底（“白板，动一下才透明”）。
+            el.style.setProperty('background-color', value, 'important');
             return true;
           }
 
@@ -701,7 +999,7 @@ internal sealed class AlifeBackground
 
             el.__alifeWpTint = bg;
             if (!el.style.transition) el.style.setProperty('transition', 'background-color .16s ease');
-            el.style.setProperty('background-color', 'rgba(' + r + ',' + g + ',' + b + ',' + alpha + ')', 'important');
+            el.style.setProperty('background-color', 'rgba(' + r + ',' + g + ',' + b + ',var(--alife-wp-bubble-a,' + alpha + '))', 'important');
             return true;
           }
 
@@ -761,6 +1059,9 @@ internal sealed class AlifeBackground
           // 把“面板级白色容器”变透明：面积 >= 视口 1.5% 且高 >= 80，
           // 再把大块多行编辑区（textarea / contenteditable）也磨砂掉，否则整块白会挡住壁纸。
           // 聊天气泡（矮）不受影响。
+          // 纯展示模式仍需要这一次透明化，否则面板的不透明白底会把壁纸整个挡住。
+          // 持续的扫描由此处的 wpObserve()（内部有 simple 保护）和补涂定时器关掉：
+          // 只有挂载 / 用户主动调白度气泡时才会跑，不再反复全页重涂。
           window.__alifeWallpaperTransparent = function () {
             var vw = window.innerWidth || 1920;
             var vh = window.innerHeight || 1080;
@@ -909,8 +1210,22 @@ internal sealed class AlifeBackground
 
           window.__alifeWallpaperRestore = function () {
             var all = document.body ? document.body.querySelectorAll('*') : [];
+            var bgProps = [
+              'background-image', 'background-position', 'background-size', 'background-repeat',
+              'background-attachment', 'background-origin', 'background-clip'
+            ];
+
             for (var i = 0; i < all.length; i++) {
               var el = all[i];
+
+              // 旧版用 background 简写，会把 background-image 等子属性写成 initial，
+              // 等于把卡片原本的背景图 / 渐变永久压成 none（界面发白）。
+              // 这里不依赖 __alifeWpBg 标记：标记可能在上一次还原时就清掉了，
+              // 残留的 initial 会一直留在元素上。
+              for (var bi = 0; bi < bgProps.length; bi++) {
+                if (el.style.getPropertyValue(bgProps[bi]) === 'initial')
+                  el.style.removeProperty(bgProps[bi]);
+              }
 
               if (el.__alifeWpTint !== undefined) {
                 el.style.setProperty('background-color', el.__alifeWpTint, 'important');
@@ -919,7 +1234,7 @@ internal sealed class AlifeBackground
 
               if (el.__alifeWpBg === undefined) continue;
 
-              el.style.setProperty('background', el.__alifeWpBg, 'important');
+              el.style.setProperty('background-color', el.__alifeWpBg, 'important');
               el.__alifeWpBg = undefined;
             }
             return 'ok';
@@ -957,7 +1272,7 @@ internal sealed class AlifeBackground
                 '#alife-wp-widget .wp-trigger.pet.failed .wp-pet-img{display:none;}' +
                 '#alife-wp-widget .wp-trigger.pet.failed .wp-pet-fallback{display:block;}' +
                 '#alife-wp-widget .wp-trigger.pet.failed{background:rgba(22,22,28,.86);border:1px solid rgba(255,255,255,.28);box-shadow:0 8px 22px rgba(0,0,0,.45);padding:0 14px 0 11px;height:38px;border-radius:19px;}' +
-                '#alife-wp-widget .wp-panel{position:absolute;right:0;bottom:54px;width:436px;max-width:calc(100vw - 24px);max-height:min(86vh,780px);display:none;flex-direction:column;border-radius:16px;background:rgba(18,18,23,.55);border:1px solid rgba(255,255,255,.12);box-shadow:0 18px 44px rgba(0,0,0,.52);backdrop-filter:blur(9px);color:#e9e9ef;overflow:hidden;}' +
+                '#alife-wp-widget .wp-panel{position:absolute;right:0;bottom:54px;width:436px;max-width:calc(100vw - 24px);max-height:min(94vh,1200px);display:none;flex-direction:column;border-radius:16px;background:rgba(18,18,23,.55);border:1px solid rgba(255,255,255,.12);box-shadow:0 18px 44px rgba(0,0,0,.52);backdrop-filter:blur(9px);color:#e9e9ef;overflow:hidden;}' +
                 '#alife-wp-widget.open .wp-panel{display:flex;}' +
                 // 面板调到很透时，文字加深色描边才不会跟壁纸糊在一起
                 '#alife-wp-widget .wp-panel.wp-thin{text-shadow:0 1px 2px rgba(0,0,0,.95),0 0 4px rgba(0,0,0,.85);border-color:rgba(255,255,255,.22);}' +
@@ -969,9 +1284,18 @@ internal sealed class AlifeBackground
                 '#alife-wp-widget .wp-scrim:hover{background:rgba(255,255,255,.16);}' +
                 '#alife-wp-widget .wp-close{border:0;background:transparent;color:#9a9aa8;font-size:17px;line-height:1;cursor:pointer;padding:2px 4px;}' +
                 '#alife-wp-widget .wp-close:hover{color:#fff;}' +
-                '#alife-wp-widget .wp-sliders{padding:8px 12px;display:grid;gap:7px;border-bottom:1px solid rgba(255,255,255,.08);}' +
-                '#alife-wp-widget .wp-sliders label{display:grid;grid-template-columns:38px 1fr 30px;align-items:center;gap:8px;font-size:11px;color:#a8a8b6;}' +
+                // 滑条两列排：画面 8 条从 8 行压到 4 行，把高度让给下面的壁纸列表
+                '#alife-wp-widget .wp-sliders{padding:8px 12px;display:grid;grid-template-columns:1fr 1fr;row-gap:7px;column-gap:14px;border-bottom:1px solid rgba(255,255,255,.08);}' +
+                '#alife-wp-widget .wp-sliders>.wp-row{grid-column:1 / -1;}' +
+                '#alife-wp-widget .wp-sliders label{display:grid;grid-template-columns:32px 1fr 26px;align-items:center;gap:6px;font-size:11px;color:#a8a8b6;min-width:0;}' +
                 '#alife-wp-widget .wp-sliders i{font-style:normal;text-align:right;color:#d6d6e0;}' +
+                '#alife-wp-widget .wp-qbtns{grid-column:1 / -1;display:flex;gap:4px;flex-wrap:wrap;padding:2px 0 4px;}' +
+                '#alife-wp-widget .wp-qbtns button{margin:0;flex:1 1 auto;min-width:56px;padding:4px 6px;font-size:11px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.08);color:#cfd3dd;border-radius:8px;cursor:pointer;}' +
+                '#alife-wp-widget .wp-qbtns button.on{background:rgba(124,196,255,.24);border-color:rgba(124,196,255,.6);color:#e8f4ff;font-weight:600;}' +
+                '#alife-wp-widget .wp-perf-row{display:flex;align-items:center;gap:6px;font-size:11px;color:#a8a8b6;padding:2px 0;}' +
+                '#alife-wp-widget .wp-perf-row span{flex:1;}' +
+                '#alife-wp-widget .wp-perf-row button{margin:0;padding:3px 10px;font-size:11px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.08);color:#cfd3dd;border-radius:8px;cursor:pointer;}' +
+                '#alife-wp-widget .wp-perf-row button.on{background:rgba(124,196,255,.22);border-color:rgba(124,196,255,.55);color:#dff0ff;}' +
                 '#alife-wp-widget .wp-row{display:flex;align-items:center;gap:8px;font-size:11px;color:#a8a8b6;}' +
                 '#alife-wp-widget .wp-row button{margin-left:auto;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.08);color:#cfd3dd;font-size:11px;padding:3px 10px;border-radius:8px;cursor:pointer;}' +
                 '#alife-wp-widget .wp-row button.on{background:rgba(124,196,255,.22);border-color:rgba(124,196,255,.55);color:#dff0ff;}' +
@@ -1077,6 +1401,20 @@ internal sealed class AlifeBackground
                   '<div class="wp-row"><span>窗口</span><button class="wp-wpo-reset" type="button" title="面板不透明度回到默认 55">还原</button></div>' +
                   '<label title="只管这个设置窗口的黑底：0 = 全透明，直接看到身后的壁纸；100 = 纯黑面板。页面里那些卡片由「白度」控制，两者互不影响">面板<input class="wp-wpo" type="range" min="0" max="100" step="5"><i></i></label>' +
                 '</div>' +
+                '<div class="wp-sliders wp-perf">' +
+                  '<div class="wp-row"><span>性能</span><button class="wp-perf-reset" type="button" title="画质与后台策略回到默认">还原</button></div>' +
+                  '<div class="wp-qbtns">' +
+                    '<button type="button" data-q="0">原样</button>' +
+                    '<button type="button" data-q="1">均衡</button>' +
+                    '<button type="button" data-q="2">省显存</button>' +
+                    '<button type="button" data-q="3">自定义</button>' +
+                  '</div>' +
+                  '<label title="仅「自定义」档位生效：0 = 跟随系统。实测贴图资源只有 0.6/0.8/1 三档，100 以上只会增加显存、几乎不会更清晰">像素<input class="wp-rs" type="range" min="0" max="200" step="25"><i></i></label>' +
+                  '<label title="仅「自定义」档位生效，10–60 帧">帧率<input class="wp-fps" type="range" min="10" max="60" step="10"><i></i></label>' +
+                  '<div class="wp-perf-row"><span>后台立即释放显存</span><button class="wp-gpu" type="button" data-on="1">开</button></div>' +
+                  '<div class="wp-perf-row"><span>后台暂停渲染</span><button class="wp-pause" type="button" data-on="1">开</button></div>' +
+                  '<div class="wp-perf-row"><span>纯展示（关交互）</span><button class="wp-simple" type="button" data-on="0">关</button></div>' +
+                '</div>' +
                 '<div class="wp-sliders wp-sound">' +
                   '<div class="wp-row"><span>音轨</span><button class="wp-audio" type="button" data-on="0">关闭</button></div>' +
                   '<label title="100% = 原始音量；超过 100 走 WebAudio 增益放大，最高 200%">音量<input class="wp-vol" type="range" min="0" max="200" step="5"><i></i></label>' +
@@ -1119,18 +1457,24 @@ internal sealed class AlifeBackground
             function wpSyncPanelSide() {
               if (!petPanel) return;
               var r = box.getBoundingClientRect();
-              var need = 520;
+              var need = 620;
               var roomAbove = r.top;
               var roomBelow = window.innerHeight - r.bottom;
               var gap = (trigger.classList.contains('pet') ? petPx : 38) + 12;
+              var useBelow = roomAbove < need && roomBelow > roomAbove;
 
-              if (roomAbove < need && roomBelow > roomAbove) {
+              if (useBelow) {
                 petPanel.style.top = 'calc(100% + 12px)';
                 petPanel.style.bottom = 'auto';
               } else {
                 petPanel.style.top = '';
                 petPanel.style.bottom = gap + 'px';
               }
+
+              // 面板尽量长，但绝不越出视口：向上展开只能用挂件上方的空间，
+              // 向下展开只能用下方空间。留 12px 边距，最少 260px 保证列表能翻。
+              var avail = useBelow ? (roomBelow - 24) : (roomAbove - gap - 12);
+              petPanel.style.maxHeight = Math.max(260, Math.round(avail)) + 'px';
 
               // 挂件拖到屏幕左半边时，面板改从它右边长出去，别伸到屏幕外
               var pw = 392;
@@ -1213,10 +1557,15 @@ internal sealed class AlifeBackground
               px: box.querySelector('.wp-px'),
               wpo: box.querySelector('.wp-wpo'),
               vol: box.querySelector('.wp-vol'),
-              rate: box.querySelector('.wp-rate')
+              rate: box.querySelector('.wp-rate'),
+              rs: box.querySelector('.wp-rs'),
+              fps: box.querySelector('.wp-fps')
             };
             var scrimBtn = box.querySelector('.wp-scrim');
             var audioBtn = box.querySelector('.wp-audio');
+            var gpuBtn = box.querySelector('.wp-gpu');
+            var pauseBtn = box.querySelector('.wp-pause');
+            var simpleBtn = box.querySelector('.wp-simple');
             var tabsEl = box.querySelector('.wp-tabs');
             var tabList = box.querySelector('.wp-tab[data-view="list"]');
             var tabProps = box.querySelector('.wp-tab[data-view="props"]');
@@ -1242,9 +1591,11 @@ internal sealed class AlifeBackground
             }
 
             function call(path) {
-              return fetch((window.__alifeWpApi || '') + path, { cache: 'no-store' })
+              // 插件重载会换端口：优先用页面 cfg 里的最新地址，缓存的 __alifeWpApi 只做兜底
+              var base = (window.__alifeWpCfg && window.__alifeWpCfg.api) || window.__alifeWpApi || '';
+              return fetch(base + path, { cache: 'no-store' })
                 .then(function (r) { return r.json(); })
-                .catch(function () { return null; });
+                .catch(function () { return { ok: false, error: 'offline' }; });
             }
 
             function wpClip(text, max) {
@@ -1261,6 +1612,8 @@ internal sealed class AlifeBackground
 
             function setSlider(el, v, fmt) {
               if (!el || v == null) return;
+              // 正在拖这个滑条时别用服务器返回值覆盖它，否则松手前后会跳一下
+              if (document.activeElement === el) return;
               el.value = v;
               var out = el.parentNode.querySelector('i');
               if (out) out.textContent = fmt ? fmt(v) : v;
@@ -1434,6 +1787,8 @@ internal sealed class AlifeBackground
               }
 
               lastState = state;
+              // 纯展示模式关了场景脚本，属性页留着只会让人白调
+              if (state.simple && propsOpen) propsOpen = false;
 
               // 位置以「最后一次拖动」为准：面板开合 / 重绘都不该把挂件弹回去
               // 正在拖动时绝不动它，否则异步回来的这份 state 会把半路拖到一半的挂件拽回旧坐标
@@ -1454,6 +1809,36 @@ internal sealed class AlifeBackground
               try { wpApplyPanelLook(state.wpanel); } catch (e) { }
               setSlider(sliders.vol, state.volume);
               setSlider(sliders.rate, state.rate, fmtRate);
+
+              // 性能：画质档位 / 自定义参数 / 后台策略
+              var q = state.quality == null ? 0 : +state.quality;
+              var qbtns = box.querySelectorAll('.wp-qbtns button');
+              for (var qbi = 0; qbi < qbtns.length; qbi++) {
+                // 用 toggle 而不是改 className：后者会把按钮自身的 class 抹掉
+                qbtns[qbi].classList.toggle('on', +qbtns[qbi].getAttribute('data-q') === q);
+              }
+              setSlider(sliders.rs, state.renderScale == null ? 0 : state.renderScale);
+              setSlider(sliders.fps, state.maxFps == null ? 60 : state.maxFps);
+              if (sliders.rs) sliders.rs.disabled = q !== 3;
+              if (sliders.fps) sliders.fps.disabled = q !== 3;
+              if (gpuBtn) {
+                var gpuOn = state.releaseGpu !== false;
+                gpuBtn.setAttribute('data-on', gpuOn ? '1' : '0');
+                gpuBtn.textContent = gpuOn ? '开' : '关';
+                gpuBtn.classList.toggle('on', gpuOn);
+              }
+              if (pauseBtn) {
+                var pauseOn = state.pauseHidden !== false;
+                pauseBtn.setAttribute('data-on', pauseOn ? '1' : '0');
+                pauseBtn.textContent = pauseOn ? '开' : '关';
+                pauseBtn.classList.toggle('on', pauseOn);
+              }
+              if (simpleBtn) {
+                var simpleOn = state.simple === true;
+                simpleBtn.setAttribute('data-on', simpleOn ? '1' : '0');
+                simpleBtn.textContent = simpleOn ? '开' : '关';
+                simpleBtn.classList.toggle('on', simpleOn);
+              }
 
               // 挂件形象（设置面板里改完下一次轮询就生效，不用重开页面）
               try { wpSetPet(state.petAvatar, state.petSize); } catch (e) { }
@@ -1517,6 +1902,7 @@ internal sealed class AlifeBackground
               if (countEl) countEl.textContent = (mineOpen ? mineItems.length : engineItems.length) + ' 张';
 
               if (tabProps) {
+                tabProps.style.display = state.simple ? 'none' : '';
                 tabProps.className = 'wp-tab' + (propsOpen ? ' on' : '');
                 tabProps.innerHTML = '属性 <em>' + propCount + '</em>';
               }
@@ -1648,21 +2034,33 @@ internal sealed class AlifeBackground
             function refresh() { return call('api/state').then(render); }
 
             var timer = 0;
+            // 仅用于「还原默认」这种需要一次性下发全部参数的动作
             function pushConfig() {
               clearTimeout(timer);
               timer = setTimeout(function () {
                 call('api/config' +
-                  '?opacity=' + sliders.op.value +
-                  '&panel=' + sliders.pa.value +
-                  '&blur=' + sliders.bl.value +
-                  '&br=' + sliders.br.value +
-                  '&ct=' + sliders.ct.value +
-                  '&sa=' + sliders.sa.value +
-                  '&bu=' + sliders.bu.value +
-                  '&px=' + sliders.px.value +
+                  '?opacity=' + (sliders.op ? sliders.op.value : 35) +
+                  '&panel=' + (sliders.pa ? sliders.pa.value : 45) +
+                  '&blur=' + (sliders.bl ? sliders.bl.value : 0) +
+                  '&br=' + (sliders.br ? sliders.br.value : 100) +
+                  '&ct=' + (sliders.ct ? sliders.ct.value : 100) +
+                  '&sa=' + (sliders.sa ? sliders.sa.value : 100) +
+                  '&bu=' + (sliders.bu ? sliders.bu.value : 65) +
+                  '&px=' + (sliders.px ? sliders.px.value : 35) +
                   // 挂件面板自己的不透明度（单独一项，跟 panel / 白度 不冲突）
                   '&wpo=' + (sliders.wpo ? sliders.wpo.value : 55)).then(render);
               }, 160);
+            }
+
+            // 单个滑条只提交自己这一项。批量发送会把「还没被 render 回填」的滑条
+            // 一起写一遍，而 range 控件没 value 时是默认中点值（遮罩 40 / 白度 50 /
+            // 模糊 15…），于是「只拖气泡」会顺手把整个画面参数改成默认值。
+            var oneTimers = {};
+            function pushOne(param, value) {
+              clearTimeout(oneTimers[param]);
+              oneTimers[param] = setTimeout(function () {
+                call('api/config?' + param + '=' + value).then(render);
+              }, 120);
             }
 
             // 音量 / 倍速只走媒体参数，不重建壁纸层
@@ -1687,12 +2085,45 @@ internal sealed class AlifeBackground
               });
             });
 
-            [sliders.op, sliders.pa, sliders.bl, sliders.br, sliders.ct, sliders.sa, sliders.bu, sliders.px, sliders.wpo].forEach(function (el) {
+            // 像素滑条：拖动时走 /api/live 直接改运行中的渲染分辨率（即时生效、不重建），
+            // 松手（change）才落盘到配置。帧率也只在松手时提交。
+            var perfTimer = 0;
+            function pushPerfLive() {
+              clearTimeout(perfTimer);
+              perfTimer = setTimeout(function () {
+                var v = sliders.rs ? +sliders.rs.value : 0;
+                call('api/live?dpr=' + (v > 0 ? (v / 100).toFixed(2) : 'auto'));
+              }, 120);
+            }
+
+            var perfSaveTimer = 0;
+            function pushPerf() {
+              clearTimeout(perfSaveTimer);
+              perfSaveTimer = setTimeout(function () {
+                call('api/config?q=3&rs=' + (sliders.rs ? sliders.rs.value : 0) +
+                     '&fps=' + (sliders.fps ? sliders.fps.value : 60)).then(render);
+              }, 200);
+            }
+
+            [sliders.rs, sliders.fps].forEach(function (el) {
               if (!el) return;
               el.addEventListener('input', function () {
                 var out = el.parentNode.querySelector('i');
                 if (out) out.textContent = el.value;
-                pushConfig();
+                if (el === sliders.rs) pushPerfLive();
+              });
+              el.addEventListener('change', function () { pushPerf(); });
+            });
+
+            [['op', 'opacity'], ['pa', 'panel'], ['bl', 'blur'], ['br', 'br'],
+             ['ct', 'ct'], ['sa', 'sa'], ['bu', 'bu'], ['px', 'px'], ['wpo', 'wpo']
+            ].forEach(function (pair) {
+              var el = sliders[pair[0]];
+              if (!el) return;
+              el.addEventListener('input', function () {
+                var out = el.parentNode.querySelector('i');
+                if (out) out.textContent = el.value;
+                pushOne(pair[1], el.value);
               });
             });
 
@@ -1836,6 +2267,40 @@ internal sealed class AlifeBackground
                   if (out) out.textContent = defaults[key];
                 }
                 pushConfig();
+              });
+            }
+
+            // 性能分组：画质档位、后台策略、一键还原
+            var qbtns = box.querySelectorAll('.wp-qbtns button');
+            for (var qk = 0; qk < qbtns.length; qk++) {
+              (function (btn) {
+                btn.addEventListener('click', function () {
+                  call('api/config?q=' + btn.getAttribute('data-q')).then(render);
+                });
+              })(qbtns[qk]);
+            }
+            if (gpuBtn) {
+              gpuBtn.addEventListener('click', function () {
+                var next = gpuBtn.getAttribute('data-on') === '1' ? '0' : '1';
+                call('api/config?rg=' + next).then(render);
+              });
+            }
+            if (pauseBtn) {
+              pauseBtn.addEventListener('click', function () {
+                var next = pauseBtn.getAttribute('data-on') === '1' ? '0' : '1';
+                call('api/config?ph=' + next).then(render);
+              });
+            }
+            if (simpleBtn) {
+              simpleBtn.addEventListener('click', function () {
+                var next = simpleBtn.getAttribute('data-on') === '1' ? '0' : '1';
+                call('api/config?sm=' + next).then(render);
+              });
+            }
+            var perfResetBtn = box.querySelector('.wp-perf-reset');
+            if (perfResetBtn) {
+              perfResetBtn.addEventListener('click', function () {
+                call('api/config?q=0&rs=0&fps=60&rg=1&ph=1&sm=0').then(render);
               });
             }
 
@@ -2015,7 +2480,7 @@ internal sealed class AlifeBackground
               wpDrag.moved = true;
               trigger.style.cursor = 'grabbing';
               wpPlaceAt(wpDrag.left0 + dx, wpDrag.top0 + dy);
-            }, true);
+            }, wps({ capture: true }));
 
             window.addEventListener('mouseup', function () {
               if (!wpDrag) return;
@@ -2030,7 +2495,7 @@ internal sealed class AlifeBackground
               wpLog('up moved=' + moved + ' at ' + Math.round(r.left) + ',' + Math.round(r.top));
               wpSavePos(r.left, r.top);
               wpSyncPanelSide();   // 拖到顶部后，面板要改到下方展开
-            }, true);
+            }, wps({ capture: true }));
 
             // 归位不再用双击：「点开面板 → 点关面板」本身就是两次点击，
             // 会落进浏览器的双击判定，于是每次开合面板都把挂件归位一次。
@@ -2122,6 +2587,20 @@ internal sealed class AlifeBackground
             return 'ok';
           };
 
+          // 新版函数已就位：把上一版 background 简写留下的 background-* initial
+          // 残留一次性扫掉（旧版 Restore 只清 4 个属性）。只删子属性、不动颜色，不会闪。
+          try {
+            var __wpRes = ['background-image', 'background-position', 'background-size', 'background-repeat',
+                           'background-attachment', 'background-origin', 'background-clip'];
+            var __wpAll = document.body ? document.body.querySelectorAll('*') : [];
+            for (var __ri = 0; __ri < __wpAll.length; __ri++) {
+              for (var __rj = 0; __rj < __wpRes.length; __rj++) {
+                if (__wpAll[__ri].style.getPropertyValue(__wpRes[__rj]) === 'initial')
+                  __wpAll[__ri].style.removeProperty(__wpRes[__rj]);
+              }
+            }
+          } catch (e) { }
+
           return 'init';
         })();
         """;
@@ -2135,6 +2614,7 @@ internal sealed class AlifeBackground
     internal static Func<string, Task<string>>? JsRunner;
 
     string? currentKey;
+    int pageReset;
 
     public AlifeBackground(ILogger logger) => this.logger = logger;
 
@@ -2150,6 +2630,12 @@ internal sealed class AlifeBackground
                     await Task.Delay(300);
                     continue;
                 }
+
+                // 每个插件实例第一次接入页面时，先把上一代（热重载残留）的
+                // DOM / 事件 / WebGL / 跨源 iframe 拆干净，再装自己的运行时。
+                // 不依赖版本号：即使 C# 改了而 JS 版本号没动，重载也不会留旧实例。
+                if (Interlocked.Exchange(ref pageReset, 1) == 0)
+                    await ExecuteAsync(TeardownScript);
 
                 await ExecuteAsync(InitScript);
                 return;
@@ -2167,12 +2653,14 @@ internal sealed class AlifeBackground
     {
         await AttachAsync();
 
+        // key 只放「必须重建才能生效」的参数：换壁纸、裁切方式、场景脚本、纯展示模式。
+        // 遮罩 / 模糊 / 画质档位 / 像素比 / 帧率全部走运行时接口（RestyleAsync / ApplyLiveAsync），
+        // 放进 key 只会让自愈拿着新 key 重新加载 235MB 的 scene.pkg。
         string key = string.Join("|",
             item.Id,
-            config.Opacity,
-            config.Blur,
             config.ContainFit ? "contain" : "cover",
-            config.SceneScripts ? "scripts" : "noscripts");
+            config.SceneScripts ? "scripts" : "noscripts",
+            config.SimpleMode);
 
         if (key == currentKey && await IsLayerAliveAsync()) return;
 
@@ -2200,7 +2688,8 @@ internal sealed class AlifeBackground
             pkg,
             liveScene = config.LiveScene && pkg.Length > 0,
             // 属性面板里的数值要靠场景脚本才生效，这个标记同时给挂件用来提示
-            scripts = config.SceneScripts,
+            // 纯展示模式关掉场景脚本（属性系统随之停用，画面照常）
+            scripts = config.SceneScripts && !config.SimpleMode,
             lib = baseUrl + "lib/webwallgl.global.min.js",
             fit = config.ContainFit ? "contain" : "cover",
             soften = !item.IsPlayable,
@@ -2228,7 +2717,15 @@ internal sealed class AlifeBackground
             // properties 给挂载用（库内部会包一层 {value}），propsNative 给原生通道用（要 {value,type}）
             properties = WallpaperProps.Overrides(WallpaperProps.Resolve(item, WallpaperProps.Store.Get(item.Id))),
             propsNative = WallpaperProps.NativeNodes(WallpaperProps.Resolve(item, WallpaperProps.Store.Get(item.Id))),
-            parallax = Math.Clamp(config.Parallax, 0, 100),
+            parallax = config.SimpleMode ? 0 : Math.Clamp(config.Parallax, 0, 100),
+            // 后台渲染策略：默认立刻销毁 GL 场景释放显存
+            pauseWhenHidden = config.PauseWhenHidden,
+            releaseGpuWhenHidden = config.ReleaseGpuWhenHidden,
+            simple = config.SimpleMode,
+            // 画质档位 0（默认）= 完全不干预：renderDpr 为 null，库按设备像素比
+            qualityPreset = Math.Clamp(config.QualityPreset, 0, 3),
+            renderDpr = QualityDpr(config),
+            maxFps = QualityFps(config),
             api = baseUrl
         });
 
@@ -2269,7 +2766,16 @@ internal sealed class AlifeBackground
             whiteScrim = config.WhiteScrim,
             brightness = Math.Clamp(config.Brightness, 0, 200) / 100.0,
             contrast = Math.Clamp(config.Contrast, 0, 200) / 100.0,
-            saturate = Math.Clamp(config.Saturate, 0, 200) / 100.0
+            saturate = Math.Clamp(config.Saturate, 0, 200) / 100.0,
+            pauseWhenHidden = config.PauseWhenHidden,
+            releaseGpuWhenHidden = config.ReleaseGpuWhenHidden,
+            simple = config.SimpleMode,
+            // 粒子 / 后处理档位（场景起来后由 setQuality 应用）
+            particles = QualityParticles(config),
+            postProcessing = QualityPost(config),
+            qualityPreset = Math.Clamp(config.QualityPreset, 0, 3),
+            renderDpr = QualityDpr(config),
+            maxFps = QualityFps(config)
         });
 
         try
@@ -2279,6 +2785,62 @@ internal sealed class AlifeBackground
         catch (Exception ex)
         {
             logger.LogWarning("[WallpaperEngine] 应用界面参数失败：" + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// 运行时直接改渲染像素比 / 帧率 / 粒子 / 后处理，不重建场景、不重新拉包。
+    /// 实例不在（后台已释放）或库版本没有这些方法时返回 no-scene / unsupported，
+    /// 调用方据此回退到「重建场景」的旧路径。
+    /// </summary>
+    public async Task<string> ApplyLiveAsync(double? dpr, double fps, string? particles, string? post, string? antiAliasing)
+    {
+        if (JsRunner == null) return "no-window";
+
+        string payload = JsonSerializer.Serialize(new { dpr, fps, particles, post, aa = antiAliasing });
+
+        string script = """
+            (function (o) {
+              var i = window.__alifeWpScene;
+              if (!i) return 'no-scene';
+
+              var done = [];
+              try {
+                if (o.dpr !== undefined && typeof i.setRenderDpr === 'function') {
+                  i.setRenderDpr(o.dpr == null ? null : +o.dpr);
+                  done.push('dpr');
+                }
+                if (o.fps && typeof i.setFps === 'function') {
+                  i.setFps(+o.fps);
+                  done.push('fps');
+                }
+                if ((o.particles || o.post || o.aa) && typeof i.setQuality === 'function') {
+                  var q = i.getQuality ? i.getQuality() : {};
+                  if (o.particles) q.particles = o.particles;
+                  if (o.post) q.postProcessing = o.post;
+                  if (o.aa) q.antiAliasing = o.aa;
+                  i.setQuality(q);
+                  done.push('quality');
+                }
+              } catch (e) { return 'err:' + ((e && e.message) || e); }
+
+              // 记进页面 cfg：之后自愈重建时沿用同样的参数
+              var c = window.__alifeWpCfg;
+              if (c) {
+                if (o.dpr !== undefined) c.liveDpr = o.dpr;
+                if (o.fps) c.maxFps = +o.fps;
+                if (o.particles) c.particles = o.particles;
+                if (o.post) c.postProcessing = o.post;
+              }
+              return done.length ? 'ok:' + done.join(',') : 'unsupported';
+            })(PAYLOAD)
+            """.Replace("PAYLOAD", payload);
+
+        try { return (await ExecuteAsync(script)).Trim(); }
+        catch (Exception ex)
+        {
+            logger.LogWarning("[WallpaperEngine] 运行时调画质失败：" + ex.Message);
+            return "error";
         }
     }
 
@@ -2404,6 +2966,20 @@ internal sealed class AlifeBackground
         catch (Exception ex) { logger.LogWarning("[WallpaperEngine] 清除界面背景失败：" + ex.Message); }
     }
 
+    /// <summary>
+    /// 模块销毁 / 热重载前彻底卸载页面侧资源。和 ClearAsync 的区别：
+    /// Clear 是「用户暂时不想看壁纸」，这里是把跨源 iframe、WebGL 上下文、
+    /// document 上的监听器、MutationObserver、AudioContext 与库缓存全部解引用。
+    /// </summary>
+    public async Task TeardownAsync()
+    {
+        currentKey = null;
+        if (JsRunner == null) return;
+
+        try { await ExecuteAsync(TeardownScript); }
+        catch (Exception ex) { logger.LogWarning("[WallpaperEngine] 卸载页面资源失败：" + ex.Message); }
+    }
+
     /// <summary>改用户属性：场景走 setProperties（不重挂 pkg），网页走 postMessage 桥。</summary>
     /// <returns>页面侧的实际落点（scene / web / no-scene / scripts-off / no-window），供挂件提示用。</returns>
     public async Task<string> ApplyPropsAsync(Dictionary<string, object?> props)
@@ -2447,9 +3023,13 @@ internal sealed class AlifeBackground
 
         try
         {
+            // 必须返回字符串：JS interop 用的是 InvokeAsync<string>，返回 boolean 会抛
+            // "The JSON value could not be converted to System.String"，于是这里 catch 成 false，
+            // 每 1.5 秒的自愈都会误判「背景层丢了」并重注入整层壁纸。
+            // 同时只做纯粹的 DOM 存在性检查：全页重涂交给 MutationObserver / ShowAsync，
+            // 不再每 1.5 秒扫一遍整页 DOM。
             string result = await ExecuteAsync(
-                "(function(){ if (window.__alifeWallpaperTransparent) window.__alifeWallpaperTransparent();" +
-                " return !!document.getElementById('alife-wallpaper'); })()");
+                "(function(){ return document.getElementById('alife-wallpaper') ? 'true' : 'false'; })()");
             return string.Equals(result?.Trim(), "true", StringComparison.OrdinalIgnoreCase);
         }
         catch
@@ -2483,6 +3063,29 @@ internal sealed class AlifeBackground
 
         return null;
     }
+
+    /// <summary>画质档位 → 帧率上限。档位 0 = 不干预，沿用库原来的 60 帧。</summary>
+    internal static int QualityFps(WallpaperConfig c) => c.QualityPreset switch
+    {
+        2 => 30,
+        3 => Math.Clamp(c.MaxFps, 10, 60),
+        _ => 60
+    };
+
+    /// <summary>画质档位 → 渲染像素比；null = 不传这个参数，由库按设备像素比自己决定。</summary>
+    internal static double? QualityDpr(WallpaperConfig c) => c.QualityPreset switch
+    {
+        1 => 1.0,
+        2 => 0.75,
+        3 => c.RenderScale <= 0 ? (double?)null : Math.Clamp(c.RenderScale, 25, 200) / 100.0,
+        _ => null
+    };
+
+    /// <summary>画质档位 → 粒子密度（库支持 off/low/medium/high）。省显存档降到 low。</summary>
+    internal static string QualityParticles(WallpaperConfig c) => c.QualityPreset == 2 ? "low" : "high";
+
+    /// <summary>画质档位 → 后处理档位（库支持 off/low/medium/high）。省显存档降到 low。</summary>
+    internal static string QualityPost(WallpaperConfig c) => c.QualityPreset == 2 ? "low" : "high";
 
     static string EscapePath(string relative)
         => string.Join("/", relative.Replace('\\', '/')
