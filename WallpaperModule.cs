@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
@@ -47,6 +48,12 @@ public sealed class WallpaperModule(
     bool checking;
     string pluginDirectory = "";
 
+    // 热重载时旧模块实例可能还活着（OnDestroy 不保证与新实例 OnAwake 严格串行）。
+    // 代次号让旧实例在 OnUpdate / 背景自愈里自动停手，避免继续往页面注入、
+    // 也避免旧静态服务一直占着端口让旧 iframe 继续跑渲染进程。
+    static int activeGeneration;
+    int generation;
+
     const string LastWallpaperKey = "presents.Wallpaper/Last";
 
     /// <summary>
@@ -57,6 +64,8 @@ public sealed class WallpaperModule(
 
     protected override Task OnAwake()
     {
+        generation = Interlocked.Increment(ref activeGeneration);
+
         try
         {
             pluginDirectory = pluginSystem.PluginContext.GetPluginDirectoryPath("presents.Wallpaper");
@@ -90,6 +99,8 @@ public sealed class WallpaperModule(
 
     protected override async Task OnStart()
     {
+        if (generation != Volatile.Read(ref activeGeneration)) return;
+
         Active = this;
 
         if (!Configuration.AutoStart) return;
@@ -136,6 +147,10 @@ public sealed class WallpaperModule(
 
     protected override Task OnUpdate()
     {
+        // 热重载后旧实例如果还挂着，绝不能再让它做背景自愈 / 轮播，
+        // 否则每次重载都会多注入一层、多留一个渲染进程。
+        if (generation != Volatile.Read(ref activeGeneration)) return Task.CompletedTask;
+
         long now = Environment.TickCount64;
 
         // 页面重载 / F5 后注入的层会消失，这里做一次轻量自愈
@@ -167,6 +182,7 @@ public sealed class WallpaperModule(
     {
         try
         {
+            if (generation != Volatile.Read(ref activeGeneration)) return;
             if (background == null || current == null) return;
             if (await background.IsLayerAliveAsync()) return;
 
@@ -200,7 +216,12 @@ public sealed class WallpaperModule(
 
         try
         {
-            if (background != null) await background.ClearAsync();
+            // 不只是撤掉壁纸层：跨源 iframe、WebGL 上下文、document 上的监听器、
+            // MutationObserver 与库缓存都要解引用，否则热重载一次就多留一份显存。
+            // 只有仍是活跃代次才拆页面：热重载时旧实例的 OnDestroy 有可能在新实例
+            // 注入之后才跑，那时页面清理交给新实例首次 Attach 做，别把新层拆掉。
+            if (generation == Volatile.Read(ref activeGeneration) && background != null)
+                await background.TeardownAsync();
         }
         catch { }
 
@@ -533,6 +554,36 @@ public sealed class WallpaperModule(
                 if (args.TryGetValue("wpo", out string? wp) && int.TryParse(wp, out int wpv))
                     Configuration.WidgetPanelOpacity = Math.Clamp(wpv, 0, 100);
 
+                // 画质档位 / 后台策略（挂件「性能」分组）
+                bool qualityChanged = false;
+                if (args.TryGetValue("q", out string? q) && int.TryParse(q, out int qv))
+                {
+                    int next = Math.Clamp(qv, 0, 3);
+                    if (next != Configuration.QualityPreset) { Configuration.QualityPreset = next; qualityChanged = true; }
+                }
+                if (args.TryGetValue("rs", out string? rs) && int.TryParse(rs, out int rsv))
+                {
+                    int next = Math.Clamp(rsv, 0, 200);
+                    if (next != Configuration.RenderScale) { Configuration.RenderScale = next; qualityChanged = true; }
+                }
+                if (args.TryGetValue("fps", out string? fp) && int.TryParse(fp, out int fpv))
+                {
+                    int next = Math.Clamp(fpv, 10, 60);
+                    if (next != Configuration.MaxFps) { Configuration.MaxFps = next; qualityChanged = true; }
+                }
+                if (args.TryGetValue("rg", out string? rg) && rg.Length > 0)
+                    Configuration.ReleaseGpuWhenHidden = IsTrue(rg);
+                if (args.TryGetValue("ph", out string? ph) && ph.Length > 0)
+                    Configuration.PauseWhenHidden = IsTrue(ph);
+
+                // 纯展示模式：脚本 / 视差 / 全页磨砂都是挂载时决定的，切换要重建当前壁纸层
+                bool modeChanged = false;
+                if (args.TryGetValue("sm", out string? sm) && sm.Length > 0)
+                {
+                    bool next = IsTrue(sm);
+                    if (next != Configuration.SimpleMode) { Configuration.SimpleMode = next; modeChanged = true; }
+                }
+
                 // 声音类参数只改 <video>，不碰样式层
                 bool media = false;
                 if (args.TryGetValue("vol", out string? vo) && int.TryParse(vo, out int vv))
@@ -555,13 +606,70 @@ public sealed class WallpaperModule(
                     || args.ContainsKey("white") || args.ContainsKey("br") || args.ContainsKey("ct")
                     || args.ContainsKey("sa") || args.ContainsKey("bu") || args.ContainsKey("px");
 
+                bool strategy = args.ContainsKey("rg") || args.ContainsKey("ph");
+
                 PersistConfig();
                 if (background != null)
                 {
-                    if (restyle) await background.RestyleAsync(Configuration);
+                    // 后台开关要立刻合并进页面 cfg，下一次失焦就用新策略
+                    if (restyle || strategy) await background.RestyleAsync(Configuration);
                     if (media) await background.ApplyMediaAsync(Configuration);
                 }
+
+                // 纯展示模式要重建（脚本 / 视差是挂载时定的）
+                if (modeChanged && current != null)
+                {
+                    await PlayAsync(current);
+                }
+                else if (qualityChanged && current != null)
+                {
+                    // 画质优先运行时直改：不重建、不重新拉 235MB 的场景包
+                    string live = background == null
+                        ? "no-window"
+                        : await background.ApplyLiveAsync(
+                            AlifeBackground.QualityDpr(Configuration),
+                            AlifeBackground.QualityFps(Configuration),
+                            AlifeBackground.QualityParticles(Configuration),
+                            AlifeBackground.QualityPost(Configuration),
+                            "off");
+
+                    // 实例不在 / 老库没有这些方法 / 用户关掉了即时生效：退回重建
+                    if (!Configuration.LiveTuning || !live.StartsWith("ok"))
+                        await PlayAsync(current);
+                }
+
                 return BuildStateJson();
+            }
+
+            // 拖动中的实时预览：只改运行中的渲染像素比，不落盘、不重建、不重新拉包
+            case "/api/live":
+            {
+                if (background == null) return "{\"ok\":false,\"error\":\"背景层未初始化\"}";
+
+                double? dpr = null;
+                bool hasDpr = false;
+
+                if (args.TryGetValue("dpr", out string? dv) && dv.Length > 0)
+                {
+                    if (dv.Equals("auto", StringComparison.OrdinalIgnoreCase))
+                    {
+                        dpr = null;
+                        hasDpr = true;
+                    }
+                    else if (double.TryParse(dv, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsed))
+                    {
+                        dpr = Math.Clamp(parsed, 0.25, 2);
+                        hasDpr = true;
+                    }
+                }
+
+                if (!hasDpr) return "{\"ok\":false,\"error\":\"缺少 dpr\"}";
+
+                string applied = await background.ApplyLiveAsync(
+                    dpr, AlifeBackground.QualityFps(Configuration), null, null, null);
+
+                // no-scene（后台已释放）/ unsupported（老库）都如实回给挂件，画面保持不动
+                return JsonSerializer.Serialize(new { ok = applied.StartsWith("ok"), applied });
             }
 
             // 挂件拖动后的位置。x / y = -1 表示归位到默认右下角
@@ -731,6 +839,13 @@ public sealed class WallpaperModule(
             rate = Math.Clamp(Configuration.PlaybackRate, 50, 200),
             kind = current?.Type ?? "",
             liveScene = Configuration.LiveScene,
+            // 挂件「性能」分组：画质档位与后台策略
+            quality = Math.Clamp(Configuration.QualityPreset, 0, 3),
+            renderScale = Math.Clamp(Configuration.RenderScale, 0, 200),
+            maxFps = Math.Clamp(Configuration.MaxFps, 10, 60),
+            releaseGpu = Configuration.ReleaseGpuWhenHidden,
+            pauseHidden = Configuration.PauseWhenHidden,
+            simple = Configuration.SimpleMode,
             // 场景脚本关着的话属性值只会被引擎存下来，画面上不会有变化：面板要能说清这件事
             scripts = Configuration.SceneScripts,
             scene,
